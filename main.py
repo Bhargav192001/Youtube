@@ -6,6 +6,10 @@ import time
 import glob
 import tempfile
 import webbrowser
+import json
+import urllib.request
+import urllib.parse
+import urllib.error
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -1951,15 +1955,107 @@ def get_cookie_file():
         if (normalized.startswith('"') and normalized.endswith('"')) or (normalized.startswith("'") and normalized.endswith("'")):
             normalized = normalized[1:-1]
         normalized = normalized.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\r\n", "\n")
+
+        if "youtube" not in normalized.lower():
+            print("[Cookies Warning] YTDLP_COOKIES does not contain any youtube.com entries! It looks like an empty cookie export.")
+        else:
+            print(f"[Cookies OK] Successfully loaded YTDLP_COOKIES ({len(normalized.splitlines())} lines).")
+
         temp_cookie_path = os.path.join(tempfile.gettempdir(), "youtube_cookies.txt")
         try:
             with open(temp_cookie_path, "w", encoding="utf-8") as f:
                 f.write(normalized)
             return temp_cookie_path
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Cookies Error] Could not write cookies file: {e}")
 
     return None
+
+def extract_info_resilient(url: str):
+    """Resilient extraction with multi-client rotation, cookie fallback, and optional upstream relay."""
+    cookie_file = get_cookie_file()
+    last_err = None
+
+    # 1. If cookies are present, try with cookies + web/mobile clients
+    if cookie_file:
+        try:
+            ydl_opts: Dict[str, Any] = {
+                "skip_download": True,
+                "extract_flat": False,
+                "cookiefile": cookie_file,
+                "source_address": "0.0.0.0",
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["web", "mweb", "android"]
+                    }
+                },
+                "js_runtimes": {"node": {}},
+                "quiet": True,
+                "no_warnings": True,
+            }
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if info:
+                    return info, False
+        except Exception as e:
+            last_err = e
+            print(f"[Fallback Info] Cookie attempt failed: {e}")
+
+    # 2. Client rotation without cookies (bypasses datacenter blocks when cookies cause 'reload' errors)
+    client_combos = [
+        ["ios", "mweb", "android"],
+        ["android_vr", "web_safari"],
+        ["tv", "tv_embedded"]
+    ]
+    for clients in client_combos:
+        try:
+            ydl_opts = {
+                "skip_download": True,
+                "extract_flat": False,
+                "source_address": "0.0.0.0",
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": clients
+                    }
+                },
+                "js_runtimes": {"node": {}},
+                "quiet": True,
+                "no_warnings": True,
+            }
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if info:
+                    return info, False
+        except Exception as e:
+            last_err = e
+            print(f"[Fallback Info] Client combo {clients} failed: {e}")
+
+    # 3. Upstream residential relay fallback (if on cloud like Render)
+    is_cloud = "PORT" in os.environ or "RENDER" in os.environ
+    if is_cloud:
+        upstream_url = os.environ.get("UPSTREAM_URL", "").rstrip("/")
+        if not upstream_url:
+            upstream_url = "https://compliant-davis-angeles-gary.trycloudflare.com"
+
+        if upstream_url:
+            try:
+                print(f"[Fallback Info] Cloud IP flagged; proxying to residential upstream: {upstream_url}")
+                payload = json.dumps({"url": url}).encode("utf-8")
+                req = urllib.request.Request(
+                    f"{upstream_url}/api/info",
+                    data=payload,
+                    headers={"Content-Type": "application/json"}
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        return data, True
+            except Exception as e:
+                print(f"[Fallback Info] Upstream relay failed: {e}")
+
+    if last_err:
+        raise last_err
+    raise RuntimeError("Failed to extract video information from all available sources.")
 
 @app.post("/api/info")
 def get_video_info(req: InfoRequest):
@@ -1967,39 +2063,22 @@ def get_video_info(req: InfoRequest):
     if not url:
         raise HTTPException(status_code=400, detail="URL cannot be empty")
 
-    cookie_file = get_cookie_file()
-
-    ydl_opts: Dict[str, Any] = {
-        "skip_download": True,
-        "extract_flat": False,
-        "js_runtimes": {"node": {}},
-        "quiet": True,
-        "no_warnings": True,
-    }
-
-    if cookie_file:
-        ydl_opts["cookiefile"] = cookie_file
-    else:
-        ydl_opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["android", "ios", "web"]
-            }
-        }
-
     try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info, is_preformatted = extract_info_resilient(url)
     except Exception as e:
         err_msg = str(e)
-        if "Sign in to confirm" in err_msg or "bot" in err_msg.lower():
+        if "Sign in to confirm" in err_msg or "bot" in err_msg.lower() or "reloaded" in err_msg.lower():
             raise HTTPException(
                 status_code=400,
-                detail="YouTube datacenter bot-check triggered. Add your YTDLP_COOKIES environment variable in Render, or run locally using 'python main.py'."
+                detail=f"YouTube bot protection: {err_msg}. Set UPSTREAM_URL in Render or run locally via 'python main.py'."
             )
         raise HTTPException(status_code=400, detail=f"Failed to fetch video: {err_msg}")
 
     if not info:
         raise HTTPException(status_code=404, detail="No video information found")
+
+    if is_preformatted:
+        return info
 
     formats = info.get("formats", [])
     available_resolutions = set()
@@ -2067,49 +2146,58 @@ def run_download_thread(task_id: str, url: str, format_type: str, quality: str):
 
     out_template = os.path.join(DOWNLOADS_DIR, f"{task_id}_%(title).150B.%(ext)s")
 
-    cookie_file = get_cookie_file()
-
-    ydl_opts: Dict[str, Any] = {
-        "outtmpl": out_template,
-        "progress_hooks": [progress_hook],
-        "js_runtimes": {"node": {}},
-        "quiet": True,
-        "no_warnings": True,
-    }
-
-    if cookie_file:
-        ydl_opts["cookiefile"] = cookie_file
-    else:
-        ydl_opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["android", "ios", "web"]
-            }
+    def execute_ytdl(c_file, p_clients):
+        ydl_opts: Dict[str, Any] = {
+            "outtmpl": out_template,
+            "progress_hooks": [progress_hook],
+            "source_address": "0.0.0.0",
+            "js_runtimes": {"node": {}},
+            "quiet": True,
+            "no_warnings": True,
         }
+        if c_file:
+            ydl_opts["cookiefile"] = c_file
+        if p_clients:
+            ydl_opts["extractor_args"] = {"youtube": {"player_client": p_clients}}
 
-    if format_type == "audio":
-        bitrate = quality if quality in ["128", "192", "320"] else "192"
-        ydl_opts.update({
-            "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": bitrate,
-            }],
-        })
-    else:
-        if not quality or quality == "best":
-            ydl_opts["format"] = "bv*+ba/b"
+        if format_type == "audio":
+            bitrate = quality if quality in ["128", "192", "320"] else "192"
+            ydl_opts.update({
+                "format": "bestaudio/best",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": bitrate,
+                }],
+            })
         else:
-            try:
-                max_h = int(quality)
-                ydl_opts["format"] = f"bv*[height<={max_h}]+ba/b[height<={max_h}]/best"
-            except ValueError:
+            if not quality or quality == "best":
                 ydl_opts["format"] = "bv*+ba/b"
-        ydl_opts["merge_output_format"] = "mp4"
+            else:
+                try:
+                    max_h = int(quality)
+                    ydl_opts["format"] = f"bv*[height<={max_h}]+ba/b[height<={max_h}]/best"
+                except ValueError:
+                    ydl_opts["format"] = "bv*+ba/b"
+            ydl_opts["merge_output_format"] = "mp4"
 
-    try:
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
+
+    cookie_file = get_cookie_file()
+    download_attempts = []
+    if cookie_file:
+        download_attempts.append((cookie_file, ["web", "mweb", "android"]))
+    download_attempts.append((None, ["ios", "mweb", "android"]))
+    download_attempts.append((None, ["android_vr", "web_safari"]))
+    download_attempts.append((None, ["tv", "tv_embedded"]))
+
+    last_err = ""
+    download_succeeded = False
+
+    for c_file, p_clients in download_attempts:
+        try:
+            execute_ytdl(c_file, p_clients)
             final_files = glob.glob(os.path.join(DOWNLOADS_DIR, f"{task_id}_*"))
             if final_files:
                 actual_file = final_files[0]
@@ -2122,12 +2210,89 @@ def run_download_thread(task_id: str, url: str, format_type: str, quality: str):
                 task["progress"] = 100.0
                 task["speed"] = ""
                 task["eta"] = ""
-            else:
+                download_succeeded = True
+                break
+        except Exception as e:
+            last_err = str(e)
+            print(f"[Download Error] with {p_clients}: {last_err}")
+            if not any(k in last_err.lower() for k in ["bot", "reloaded", "sign in", "unplayable", "403", "429"]):
+                break
+
+    if download_succeeded:
+        return
+
+    # Upstream residential relay fallback (if on cloud)
+    is_cloud = "PORT" in os.environ or "RENDER" in os.environ
+    if is_cloud:
+        upstream_url = os.environ.get("UPSTREAM_URL", "").rstrip("/")
+        if not upstream_url:
+            upstream_url = "https://compliant-davis-angeles-gary.trycloudflare.com"
+
+        if upstream_url:
+            try:
+                task["status"] = "downloading"
+                task["speed"] = "Connecting to residential relay..."
+                payload = json.dumps({
+                    "url": url,
+                    "format_type": format_type,
+                    "quality": quality,
+                }).encode("utf-8")
+                req = urllib.request.Request(
+                    f"{upstream_url}/api/download",
+                    data=payload,
+                    headers={"Content-Type": "application/json"}
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    up_data = json.loads(resp.read().decode("utf-8"))
+                    up_task_id = up_data["task_id"]
+
+                while True:
+                    time.sleep(1)
+                    with urllib.request.urlopen(f"{upstream_url}/api/progress/{up_task_id}", timeout=15) as p_resp:
+                        up_p = json.loads(p_resp.read().decode("utf-8"))
+                        up_status = up_p.get("status")
+
+                        task["progress"] = up_p.get("progress", 0.0)
+                        task["downloaded_str"] = up_p.get("downloaded_str", "")
+                        task["total_str"] = up_p.get("total_str", "")
+                        task["speed"] = up_p.get("speed", "")
+                        task["eta"] = up_p.get("eta", "")
+
+                        if up_status == "completed":
+                            task["status"] = "processing"
+                            task["speed"] = "Finalizing file delivery..."
+                            up_filename = up_p.get("filename", f"download_{task_id}.mp4")
+                            dest_filepath = os.path.join(DOWNLOADS_DIR, f"{task_id}_{up_filename}")
+
+                            file_url = f"{upstream_url}/api/file/{up_task_id}"
+                            with urllib.request.urlopen(file_url, timeout=120) as stream_resp:
+                                with open(dest_filepath, "wb") as out_f:
+                                    while True:
+                                        chunk = stream_resp.read(64 * 1024)
+                                        if not chunk:
+                                            break
+                                        out_f.write(chunk)
+
+                            task["filepath"] = dest_filepath
+                            task["filename"] = up_filename
+                            task["file_size_str"] = format_bytes(os.path.getsize(dest_filepath))
+                            task["status"] = "completed"
+                            task["progress"] = 100.0
+                            task["speed"] = ""
+                            task["eta"] = ""
+                            return
+                        elif up_status == "failed":
+                            task["status"] = "failed"
+                            task["error"] = up_p.get("error", "Upstream download failed")
+                            return
+            except Exception as e:
+                print(f"[Upstream Relay Failed] {e}")
                 task["status"] = "failed"
-                task["error"] = "Downloaded file could not be located on disk."
-    except Exception as e:
-        task["status"] = "failed"
-        task["error"] = str(e)
+                task["error"] = f"Download failed: {last_err or str(e)}"
+                return
+
+    task["status"] = "failed"
+    task["error"] = f"Download failed: {last_err or 'Unknown error during extraction'}"
 
 @app.post("/api/download")
 def start_download(req: DownloadRequest):
@@ -2225,9 +2390,9 @@ if __name__ == "__main__":
         host = "0.0.0.0" if is_cloud else "127.0.0.1"
 
         print("=" * 60)
-        print("🚀 Starting PulseDL - YouTube Video & Audio Downloader")
-        print(f"🌐 Server running at: http://{host}:{port}")
-        print("💡 Tip: Run 'python main.py --cli' for terminal mode.")
+        print("[PulseDL] Starting YouTube Video & Audio Downloader")
+        print(f"[Server] Running at: http://{host}:{port}")
+        print("[Tip] Run 'python main.py --cli' for terminal mode.")
         print("=" * 60)
 
         if not is_cloud:
