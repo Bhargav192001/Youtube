@@ -407,6 +407,10 @@ body {
   border: 1px solid var(--border-glass);
   border-radius: var(--radius-md);
   transition: all var(--transition-fast);
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  overflow: hidden;
 }
 
 .input-wrapper:focus-within {
@@ -416,28 +420,33 @@ body {
 }
 
 .input-icon {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
-  padding-left: 16px;
+  padding-left: 14px;
   color: var(--text-dim);
 }
 
 #urlInput {
   flex: 1;
+  min-width: 0;
+  width: 100%;
   background: transparent;
   border: none;
   outline: none;
   font-family: var(--font-body);
   font-size: 0.95rem;
   color: var(--text-main);
-  padding: 14px 14px;
+  padding: 14px 10px 14px 8px;
 }
 
 #urlInput::placeholder {
   color: var(--text-dim);
+  text-overflow: ellipsis;
 }
 
 .btn-icon {
+  flex-shrink: 0;
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid var(--border-glass);
   color: var(--text-muted);
@@ -450,6 +459,7 @@ body {
   gap: 5px;
   font-size: 0.78rem;
   font-weight: 500;
+  white-space: nowrap;
   transition: all var(--transition-fast);
 }
 
@@ -1067,24 +1077,130 @@ body {
 
 /* Responsive */
 @media (max-width: 768px) {
+  .container {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+
+  .app-header {
+    padding: 16px 0 10px;
+  }
+
+  .brand-name {
+    font-size: 1.3rem;
+  }
+
+  .hero-section {
+    padding: 20px 0 18px;
+  }
+
   .hero-title {
-    font-size: 2.1rem;
+    font-size: 1.85rem;
+    line-height: 1.2;
+    margin-bottom: 10px;
+  }
+
+  .hero-subtitle {
+    font-size: 0.88rem;
+  }
+
+  .input-card {
+    padding: 14px;
   }
 
   .url-form {
     flex-direction: column;
+    gap: 10px;
+  }
+
+  .input-wrapper {
+    width: 100%;
+    min-width: 0;
+  }
+
+  #urlInput {
+    font-size: 0.88rem;
+    padding: 12px 6px 12px 4px;
+  }
+
+  .input-icon {
+    padding-left: 10px;
+  }
+
+  .btn {
+    width: 100%;
+    padding: 12px 18px;
+  }
+
+  .preview-card {
+    padding: 14px;
   }
 
   .preview-layout {
     grid-template-columns: 1fr;
+    gap: 16px;
+  }
+
+  .thumbnail-wrapper {
+    max-width: 100%;
+  }
+
+  .video-title {
+    font-size: 1.05rem;
+  }
+
+  .quality-grid {
+    grid-template-columns: repeat(2, 1fr);
   }
 
   .metrics-grid {
     grid-template-columns: 1fr;
+    gap: 8px;
+    padding: 10px 12px;
   }
 
   .action-buttons {
     flex-direction: column;
+  }
+}
+
+@media (max-width: 480px) {
+  .container {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+
+  .hero-title {
+    font-size: 1.6rem;
+  }
+
+  .status-badge {
+    font-size: 0.68rem;
+    padding: 4px 8px;
+  }
+
+  .btn-icon {
+    padding: 5px 8px;
+    margin-right: 6px;
+    font-size: 0.72rem;
+  }
+
+  .btn-icon svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  #urlInput {
+    font-size: 0.82rem;
+  }
+
+  #urlInput::placeholder {
+    font-size: 0.8rem;
+  }
+
+  .quality-pill {
+    padding: 7px 8px;
+    font-size: 0.78rem;
   }
 }
 
@@ -1818,25 +1934,63 @@ def index_page():
 def health_check():
     return {"status": "ok"}
 
+@app.get("/.well-known/{path:path}")
+def well_known_probe(path: str):
+    return {}
+
+def get_cookie_file():
+    # 1. Check local cookies.txt file
+    local_cookie = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+    if os.path.exists(local_cookie) and os.path.getsize(local_cookie) > 0:
+        return local_cookie
+
+    # 2. Check environment variable YTDLP_COOKIES (for Render dashboard)
+    raw_cookies = os.environ.get("YTDLP_COOKIES")
+    if raw_cookies:
+        temp_cookie_path = os.path.join(tempfile.gettempdir(), "youtube_cookies.txt")
+        try:
+            with open(temp_cookie_path, "w", encoding="utf-8") as f:
+                f.write(raw_cookies)
+            return temp_cookie_path
+        except Exception:
+            pass
+
+    return None
+
 @app.post("/api/info")
 def get_video_info(req: InfoRequest):
     url = req.url.strip()
     if not url:
         raise HTTPException(status_code=400, detail="URL cannot be empty")
 
-    ydl_opts = {
+    ydl_opts: Dict[str, Any] = {
         "skip_download": True,
         "extract_flat": False,
         "js_runtimes": {"node": {}},
         "quiet": True,
         "no_warnings": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "web"]
+            }
+        },
     }
+
+    cookie_file = get_cookie_file()
+    if cookie_file:
+        ydl_opts["cookiefile"] = cookie_file
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to fetch video: {str(e)}")
+        err_msg = str(e)
+        if "Sign in to confirm" in err_msg or "bot" in err_msg.lower():
+            raise HTTPException(
+                status_code=400,
+                detail="YouTube datacenter bot-check triggered. Add your YTDLP_COOKIES environment variable in Render, or run locally using 'python main.py'."
+            )
+        raise HTTPException(status_code=400, detail=f"Failed to fetch video: {err_msg}")
 
     if not info:
         raise HTTPException(status_code=404, detail="No video information found")
@@ -1913,7 +2067,16 @@ def run_download_thread(task_id: str, url: str, format_type: str, quality: str):
         "js_runtimes": {"node": {}},
         "quiet": True,
         "no_warnings": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "web"]
+            }
+        },
     }
+
+    cookie_file = get_cookie_file()
+    if cookie_file:
+        ydl_opts["cookiefile"] = cookie_file
 
     if format_type == "audio":
         bitrate = quality if quality in ["128", "192", "320"] else "192"
