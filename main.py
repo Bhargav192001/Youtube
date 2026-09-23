@@ -1946,11 +1946,15 @@ def get_cookie_file():
 
     # 2. Check environment variable YTDLP_COOKIES (for Render dashboard)
     raw_cookies = os.environ.get("YTDLP_COOKIES")
-    if raw_cookies:
+    if raw_cookies and raw_cookies.strip():
+        normalized = raw_cookies.strip()
+        if (normalized.startswith('"') and normalized.endswith('"')) or (normalized.startswith("'") and normalized.endswith("'")):
+            normalized = normalized[1:-1]
+        normalized = normalized.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\r\n", "\n")
         temp_cookie_path = os.path.join(tempfile.gettempdir(), "youtube_cookies.txt")
         try:
             with open(temp_cookie_path, "w", encoding="utf-8") as f:
-                f.write(raw_cookies)
+                f.write(normalized)
             return temp_cookie_path
         except Exception:
             pass
@@ -1963,22 +1967,24 @@ def get_video_info(req: InfoRequest):
     if not url:
         raise HTTPException(status_code=400, detail="URL cannot be empty")
 
+    cookie_file = get_cookie_file()
+
     ydl_opts: Dict[str, Any] = {
         "skip_download": True,
         "extract_flat": False,
         "js_runtimes": {"node": {}},
         "quiet": True,
         "no_warnings": True,
-        "extractor_args": {
+    }
+
+    if cookie_file:
+        ydl_opts["cookiefile"] = cookie_file
+    else:
+        ydl_opts["extractor_args"] = {
             "youtube": {
                 "player_client": ["android", "ios", "web"]
             }
-        },
-    }
-
-    cookie_file = get_cookie_file()
-    if cookie_file:
-        ydl_opts["cookiefile"] = cookie_file
+        }
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
@@ -2061,22 +2067,24 @@ def run_download_thread(task_id: str, url: str, format_type: str, quality: str):
 
     out_template = os.path.join(DOWNLOADS_DIR, f"{task_id}_%(title).150B.%(ext)s")
 
+    cookie_file = get_cookie_file()
+
     ydl_opts: Dict[str, Any] = {
         "outtmpl": out_template,
         "progress_hooks": [progress_hook],
         "js_runtimes": {"node": {}},
         "quiet": True,
         "no_warnings": True,
-        "extractor_args": {
+    }
+
+    if cookie_file:
+        ydl_opts["cookiefile"] = cookie_file
+    else:
+        ydl_opts["extractor_args"] = {
             "youtube": {
                 "player_client": ["android", "ios", "web"]
             }
-        },
-    }
-
-    cookie_file = get_cookie_file()
-    if cookie_file:
-        ydl_opts["cookiefile"] = cookie_file
+        }
 
     if format_type == "audio":
         bitrate = quality if quality in ["128", "192", "320"] else "192"
