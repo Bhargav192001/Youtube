@@ -5,6 +5,7 @@ import threading
 import time
 import uvicorn
 from yt_dlp import YoutubeDL
+from app import app
 
 def open_browser(port):
     time.sleep(1.2)
